@@ -40,6 +40,7 @@ export default function ChapterEditorPage() {
   const [history, setHistory] = useState<ContentBlock[][]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [activeBlockId, setActiveBlockId] = useState<number | null>(null);
+  const [focusBlockId, setFocusBlockId] = useState<number | null>(null);
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'dirty'>('saved');
   const [lastSavedTime, setLastSavedTime] = useState<string>('Сохранено только что');
 
@@ -213,6 +214,85 @@ export default function ChapterEditorPage() {
     
     // Save with debounce
     triggerAutosave(nextBlocks);
+  };
+
+  const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>, blockId: number) => {
+    const pastedText = e.clipboardData.getData('text');
+    if (!pastedText) return;
+
+    // Split text by newlines and filter out empty paragraphs
+    const lines = pastedText.split(/\r?\n/);
+    const paragraphs = lines.map(line => line.trim()).filter(line => line.length > 0);
+
+    if (paragraphs.length <= 1) {
+      // Let the default browser paste handle single-line pastes
+      return;
+    }
+
+    e.preventDefault();
+
+    const blockIndex = blocks.findIndex(b => b.id === blockId);
+    if (blockIndex === -1) return;
+
+    const currentBlock = blocks[blockIndex];
+    const textarea = e.currentTarget;
+    const selectionStart = textarea.selectionStart || 0;
+    const selectionEnd = textarea.selectionEnd || 0;
+
+    const contentBefore = currentBlock.content.substring(0, selectionStart);
+    const contentAfter = currentBlock.content.substring(selectionEnd);
+
+    setSaveStatus('saving');
+    try {
+      // 1. Update the first block content
+      const firstParagraphContent = contentBefore + paragraphs[0];
+      const updatedCurrentBlock = { ...currentBlock, content: firstParagraphContent };
+      await api.blocks.update(currentBlock.id, {
+        content: firstParagraphContent,
+        style: currentBlock.style,
+        media_id: currentBlock.media_id,
+      });
+
+      // 2. Create subsequent blocks concurrently
+      const createdPromises = paragraphs.slice(1).map((para, i) => {
+        const isLast = i === paragraphs.length - 2;
+        const blockContent = isLast ? para + contentAfter : para;
+        return api.blocks.create(activeChapterId, {
+          type: 'paragraph',
+          content: blockContent,
+          style: null,
+          media_id: null,
+        });
+      });
+
+      const createdBlocks = await Promise.all(createdPromises);
+
+      // 3. Construct new block list
+      const nextBlocks = [...blocks];
+      nextBlocks[blockIndex] = updatedCurrentBlock;
+      nextBlocks.splice(blockIndex + 1, 0, ...createdBlocks);
+
+      // 4. Reorder on server
+      await api.blocks.reorder(activeChapterId, nextBlocks.map(b => b.id));
+
+      // 5. Fetch fresh blocks list
+      const freshBlocks = await api.blocks.list(activeChapterId);
+      
+      // Update state and history
+      updateBlocksState(freshBlocks);
+      setSaveStatus('saved');
+
+      // Focus the last pasted block's textarea
+      if (createdBlocks.length > 0) {
+        const lastCreatedBlock = createdBlocks[createdBlocks.length - 1];
+        setFocusBlockId(lastCreatedBlock.id);
+        setActiveBlockId(lastCreatedBlock.id);
+      }
+    } catch (err: any) {
+      console.error('Failed to paste paragraphs:', err);
+      alert('Ошибка при вставке абзацев: ' + err.message);
+      setSaveStatus('dirty');
+    }
   };
 
   // Convert block type (Slash commands helper)
@@ -623,6 +703,16 @@ export default function ChapterEditorPage() {
                           <textarea
                             value={block.content}
                             onChange={(e) => updateBlockContent(block.id, e.target.value)}
+                            onPaste={(e) => handlePaste(e, block.id)}
+                            ref={el => {
+                              if (el && block.id === focusBlockId) {
+                                setTimeout(() => {
+                                  el.focus();
+                                  el.selectionStart = el.selectionEnd = el.value.length;
+                                  setFocusBlockId(null);
+                                }, 0);
+                              }
+                            }}
                             placeholder={block.type === 'heading' ? 'Большой заголовок...' : block.type === 'subheading' ? 'Подзаголовок...' : 'Введите текст...'}
                             rows={Math.max(1, Math.ceil(block.content.length / 80))}
                             style={{
@@ -704,6 +794,48 @@ export default function ChapterEditorPage() {
                         }}>
                           {/* Type indicator and converter options */}
                           <span style={{ fontWeight: 600, color: 'var(--text-muted)' }}>Тип: {block.type}</span>
+
+                          {['paragraph', 'heading', 'subheading', 'quote'].includes(block.type) && (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '6px', borderLeft: '1px solid var(--border-color)', paddingLeft: '12px' }}>
+                              <span style={{ color: 'var(--text-muted)', fontSize: '0.75rem' }}>Сменить на:</span>
+                              {block.type !== 'paragraph' && (
+                                <button
+                                  onClick={() => changeBlockType(block.id, 'paragraph')}
+                                  style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 6px', borderRadius: '4px', backgroundColor: 'var(--bg-secondary)', border: '1px solid var(--border-color)', cursor: 'pointer', fontSize: '0.75rem', color: 'var(--text-primary)' }}
+                                  title="Преобразовать в обычный текст"
+                                >
+                                  <AlignLeft size={12} /> Текст
+                                </button>
+                              )}
+                              {block.type !== 'heading' && (
+                                <button
+                                  onClick={() => changeBlockType(block.id, 'heading')}
+                                  style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 6px', borderRadius: '4px', backgroundColor: 'var(--bg-secondary)', border: '1px solid var(--border-color)', cursor: 'pointer', fontSize: '0.75rem', color: 'var(--text-primary)' }}
+                                  title="Преобразовать в заголовок"
+                                >
+                                  <Heading size={12} /> Заголовок
+                                </button>
+                              )}
+                              {block.type !== 'subheading' && (
+                                <button
+                                  onClick={() => changeBlockType(block.id, 'subheading')}
+                                  style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 6px', borderRadius: '4px', backgroundColor: 'var(--bg-secondary)', border: '1px solid var(--border-color)', cursor: 'pointer', fontSize: '0.75rem', color: 'var(--text-primary)' }}
+                                  title="Преобразовать в подзаголовок"
+                                >
+                                  <Heading size={10} /> Подзаголовок
+                                </button>
+                              )}
+                              {block.type !== 'quote' && (
+                                <button
+                                  onClick={() => changeBlockType(block.id, 'quote')}
+                                  style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 6px', borderRadius: '4px', backgroundColor: 'var(--bg-secondary)', border: '1px solid var(--border-color)', cursor: 'pointer', fontSize: '0.75rem', color: 'var(--text-primary)' }}
+                                  title="Преобразовать в цитату"
+                                >
+                                  <Quote size={12} /> Цитата
+                                </button>
+                              )}
+                            </div>
+                          )}
                           
                           {/* Text aligning options */}
                           {['left', 'center', 'right', 'justify'].includes(block.style?.align || 'left') && (
